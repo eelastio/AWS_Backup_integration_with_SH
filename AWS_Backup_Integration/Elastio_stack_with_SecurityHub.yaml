@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploys the Integration for Elastio with AWS Backup
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Elastio Integration Configuration
+        Parameters: 
+            - LogsBucketName  
+            - LambdaTriggerTag
+            - StackBinaryURL
+    ParameterLabels:
+      LogsBucketName:
+        default: S3 Bucket for Elastio Logs and Data 
+      LambdaTriggerTag:
+        default: RecoveryPoint Tag to initiate Elastio Scan
+      StackBinaryURL:
+        default: The URL for the StackBinary Zip File         
+Parameters:
+  LogsBucketName:
+    Description: The S3 Bucket Name where the Job Logs and Reports are to be stored. 
+    Type: String
+  LambdaTriggerTag:
+    Description: The Tag in an AWS Backup RecoveryPoint that will initiate an Elastio Scan
+    Type: String
+  StackBinaryURL:
+    Description: The URL for the StackBinary Zip File
+    Type: String    
+    Default: 'https://observer-solution-artefacts.s3.us-west-2.amazonaws.com/aws-backup-elastio-integration.zip'    
+  
+Resources: 
+  SolutionLocalCacheBucket:
+    Type: "AWS::S3::Bucket"
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true  
+
+  CleanupSolutionLocalCacheBucketOnDelete:
+    Type: Custom::CleanupBucket
+    Properties:
+      ServiceToken: !GetAtt GlobalCfnCodeReplicatorLambda.Arn
+      S3BucketToCleanup: !Ref SolutionLocalCacheBucket  
+
+  CopySolutionToLocalCacheBucket:
+    Type: Custom::ReplicateSolutionBinaries
+    Properties:
+      ServiceToken: !GetAtt GlobalCfnCodeReplicatorLambda.Arn
+      SolutionDestinationBucket: !Ref SolutionLocalCacheBucket
+      SolutionURL: !Ref StackBinaryURL
+
+  GlobalCfnCodeReplicatorLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W89
+              reason: "Custom resource deployed in default VPC"
+            - id: W92
+              reason: "ReservedConcurrentExecutions not needed since this function runs once when CloudFormation deploys"    
+    Properties:
+      Code:
+        ZipFile: |-
+          #!/usr/bin/env python
+          # -*- coding: utf-8 -*-
+          import json
+          import boto3
+          import urllib3
+          import os
+          import shutil
+          from urllib.parse import urlparse
+          physical_resource_id = 'GlobalCfnCodeReplicator'  
+          def process_bucket_cleanup_request(bucket_name):
+              print(f"process_bucket_cleanup_request starting for bucket_name : {bucket_name}")
+              s3 = boto3.resource('s3')
+              bucket_to_delete = s3.Bucket(bucket_name)
+              response = bucket_to_delete.objects.all().delete()
+              print(f"process_bucket_cleanup_request all object delete done. Response : {response}")
+        
+          def download_url(url, save_path):
+            c = urllib3.PoolManager()
+            with c.request('GET',url, preload_content=False) as resp, open(save_path, 'wb') as out_file:
+                shutil.copyfileobj(resp, out_file)
+            resp.release_conn()
+            
+          def lambda_handler(event, context):
+            try:
+                print(f'Handling event : {event}')
+                request_type = event.get('RequestType')              
+                solution_url = event['ResourceProperties'].get('SolutionURL')
+                solution_bucket = event['ResourceProperties'].get('SolutionDestinationBucket')
+                response_data = {
+                    'RequestType': request_type,
+                    'SolutionURL' : solution_url,
+                    'SolutionDestinationBucket' : solution_bucket
+                }
+                if request_type == 'Create' or request_type == 'Update':
+                    if solution_url:
+                        print(f'downloading file from : {solution_url}')
+                        a = urlparse(solution_url)
+                        original_file_name = os.path.basename(a.path)
+                        temp_file_name = '/tmp/'+original_file_name
+                        download_url(solution_url,temp_file_name)
+                        file_size = (os.stat(temp_file_name).st_size / 1024)
+                        print(f'Downloaded report to File : {temp_file_name} , Size : {file_size}')
+                        #Upload this to the Bucket
+                        s3_client = boto3.client('s3')
+                        print(f"uploading payload to : {solution_bucket} at {original_file_name}")
+                        extraArgsForUpload = {'ACL':'bucket-owner-full-control', 'Tagging':'Source=StackBinaryURL'}
+                        s3_client.upload_file(Filename=temp_file_name, Bucket=solution_bucket, Key='bin/' + original_file_name,ExtraArgs=extraArgsForUpload)
+                elif request_type == 'Delete':
+                    solution_bucket = event['ResourceProperties'].get('S3BucketToCleanup')
+                    if solution_bucket:
+                        process_bucket_cleanup_request(solution_bucket)
+                    
+                send(event, context, 'SUCCESS', response_data, physical_resource_id)
+            except Exception as e:
+                print(f'{e}')
+                send(event, context, 'FAILED', response_data, physical_resource_id)
+          def send(event, context, response_status, response_data, physical_resource_id, no_echo=False):
+            http = urllib3.PoolManager()
+            response_url = event['ResponseURL']
+            json_response_body = json.dumps({
+                'Status': response_status,
+                'Reason': f'See the details in CloudWatch Log Stream: {context.log_stream_name}',
+                'PhysicalResourceId': physical_resource_id,
+                'StackId': event['StackId'],
+                'RequestId': event['RequestId'],
+                'LogicalResourceId': event['LogicalResourceId'],
+                'NoEcho': no_echo,
+                'Data': response_data
+            }).encode('utf-8')
+            headers = {
+                'content-type': '',
+                'content-length': str(len(json_response_body))
+            }
+            try:
+                http.request('PUT', response_url,
+                             body=json_response_body, headers=headers)
+            except Exception as e:  # pylint: disable = W0703
+                print(e)
+      Description: Copy Solutions Binary to Local Cache Bucket
+      Handler: index.lambda_handler
+      Role : !GetAtt ElastioStatusHandlerLambdaRole.Arn
+      Runtime: python3.10
+      Architectures: 
+            - arm64
+      Timeout: 300
+  ProcessAWSBackupVaultStatusEventRuleForElastio: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Name: ProcessAWSBackupVaultStatusEventRuleForElastio
+      Description: "Rule to direct AWS Backup Events to Elastio Status Handler Lambda"
+      State: "ENABLED"
+      EventPattern: 
+        source:
+          - 'aws.backup'
+        detail-type:
+          - 'Recovery Point State Change'
+      Targets: 
+        - Arn: !GetAtt
+                  - ElastioStatusHandlerLambda
+                  - Arn
+          Id: "ProcessAWSBackupEventsUsingLambda" 
+          
+  ProcessAWSBackupVaultStatusEventRuleForElastioInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ElastioStatusHandlerLambda
+      Principal: events.amazonaws.com
+      SourceArn: !Sub ${ProcessAWSBackupVaultStatusEventRuleForElastio.Arn}
+      
+  ElastioStatusHandlerLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W89
+              reason: "NA"
+            - id: W92
+              reason: "NA"   
+    DependsOn: CopySolutionToLocalCacheBucket              
+    Properties:
+      Code:
+        S3Bucket: !Ref SolutionLocalCacheBucket
+        S3Key: 'bin/aws-backup-elastio-integration.zip'
+      Description: Handle AWS Backup and Elastio Scan results
+      Handler: lambda_handler.handler
+      Role : !GetAtt ElastioStatusHandlerLambdaRole.Arn
+      Runtime: python3.10
+      Architectures: 
+            - arm64      
+      Timeout: 900
+      Environment:
+        Variables:
+          ElastioStatusEB : !Ref ElastioJobStatusEventBus 
+          LogsBucketName: !Ref LogsBucketName
+          ElastioImportLambdaARN : !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:elastio-bg-jobs-service-aws-backup-rp-import"
+          LambdaTriggerTag: !Ref LambdaTriggerTag
+  ElastioJobStatusEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Join [ '', ['ElastioJobStatusEventBus-', !Ref 'AWS::AccountId'] ]
+
+  ElastioStatusEventBridgeInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ElastioStatusHandlerLambda
+      Principal: events.amazonaws.com
+      SourceArn: !Sub ${ElastioStatusEventRule.Arn}    
+  
+  ElastioStatusEventRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Send Elastio events to Lambda"
+      EventBusName: !Ref ElastioJobStatusEventBus
+      State: "ENABLED"
+      EventPattern: 
+        source:
+          - 'elastio.iscan'
+      Targets: 
+        - Arn: !GetAtt ElastioStatusHandlerLambda.Arn
+          Id: "ElastioStatusEvent"
+  
+  ElastioJobStatusEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties: 
+        EventBusName: !Ref ElastioJobStatusEventBus
+        StatementId: "ElastioStatusEventBridgePolicyStmt"
+        Statement: 
+            Effect: "Allow"
+            Principal: "*"
+            Action: "events:PutEvents"
+            Resource: !GetAtt "ElastioJobStatusEventBus.Arn"
+
+  ElastioStatusHandlerLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Metadata:    
+      cfn_nag:
+        rules_to_suppress:
+          - id: F3
+          - id: W11
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+          - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+          - PolicyName: invokeLambda
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+              - Effect: Allow
+                Action:
+                - lambda:InvokeFunction
+                Resource: '*'           
+          - PolicyName: s3Permissions
+            PolicyDocument:
+              Statement:
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                  - kms:Encrypt                  
+                  - s3:PutObject*
+                  - s3:GetObject*
+                  - s3:DeleteObject
+                  - s3:*BucketNotification
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload                  
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${LogsBucketName}/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${LogsBucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${SolutionLocalCacheBucket}/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${SolutionLocalCacheBucket}'                    
+          - PolicyName: logStreamPermissions
+            PolicyDocument:
+              Statement:                       
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'   
+          - PolicyName: secHubPermissions
+            PolicyDocument:
+              Statement:                       
+              - Effect: Allow
+                Action:
+                  - 'securityhub:BatchImportFindings'
+                  - 'securityhub:CreateInsight'
+                Resource: 
+                  - !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:product/*/*'
+                  - !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default'        
+            
+Outputs:
+  StackName:
+    Value: !Ref AWS::StackName

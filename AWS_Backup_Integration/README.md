@@ -27,7 +27,7 @@ Elastio imports AWS Backups as globally deduplicated and compressed, resulting i
 3. The event triggers a Lambda function that invokes an Elastio processing pipeline. The pipeline imports the recovery point and performs a cyber scan on all associated objects, including the EBS volumes and the AMI. 
 4. After the pipeline completes, detailed artifacts are generated and sent to EventBridge. 
 5. A Job Status Lambda function is triggered to copy the artifacts to an Amazon S3 bucket. 
-6. The artifacts are stored in S3. Alternatively, the lambda can be modified to send artifacts to any system, including SecurityHub, Datadog, and Splunk.
+6. The artifacts are stored in S3 and sent to Securityhub. Alternatively, the lambda can be modified to send artifacts to any system, including Datadog, and Splunk.
 
 ### Cross Account Configuration
 
@@ -38,7 +38,7 @@ Elastio imports AWS Backups as globally deduplicated and compressed, resulting i
 3. The event triggers a Lambda function that invokes an Elastio processing pipeline. The pipeline imports the recovery point and performs a cyber scan on all associated objects, including the EBS volumes and the AMI. 
 4. After the pipeline completes, detailed artifacts are generated and sent to EventBridge. 
 5. A Job Status Lambda function is triggered to copy the artifacts to an Amazon S3 bucket. You can learn more about the Job Status Lambda function [here](https://docs.aws.amazon.com/step-functions/latest/dg/sample-project-job-poller.html).
-6. The artifacts are stored in S3. Alternatively, the lambda can be modified to send artifacts to any system, including SecurityHub, Datadog, and Splunk.
+6. The artifacts are stored in S3 and sent to Securityhub. Alternatively, the lambda can be modified to send artifacts to any system, including Datadog, and Splunk.
 
 ### Deploying AWS Backup CloudFormation
 
